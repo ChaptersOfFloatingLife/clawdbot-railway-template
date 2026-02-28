@@ -42,6 +42,38 @@ const WORKSPACE_DIR =
 
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
+if (!SETUP_PASSWORD) {
+  console.error("[wrapper] FATAL: SETUP_PASSWORD environment variable is required");
+  process.exit(2);
+}
+
+// Wait for Chrome CDP to be ready (when BROWSER_CDP_URL is set)
+async function waitForChromeReady(timeoutMs = 60000) {
+  const cdpUrl = process.env.BROWSER_CDP_URL;
+  if (!cdpUrl) return true; // No CDP configured, skip
+
+  const start = Date.now();
+  const checkInterval = 1000;
+
+  console.log("[wrapper] waiting for Chrome CDP...");
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const response = await fetch(`${cdpUrl}/json/version`, { timeout: 2000 });
+      if (response.ok) {
+        const data = await response.json();
+        console.log(`[wrapper] Chrome ready: ${data.Browser}`);
+        return true;
+      }
+    } catch {
+      // Not ready yet, wait and retry
+    }
+    await new Promise(r => setTimeout(r, checkInterval));
+  }
+
+  console.error("[wrapper] Chrome CDP not ready within timeout, continuing anyway...");
+  return false;
+}
 
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
@@ -1352,6 +1384,75 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
+// --- noVNC proxy (Chrome VNC view) ---
+// noVNC runs internally on port 8081, exposed via /vnc path
+const NOVNC_TARGET = process.env.NOVNC_TARGET ?? "http://127.0.0.1:8081";
+
+const novncProxy = httpProxy.createProxyServer({
+  target: NOVNC_TARGET,
+  ws: false,
+  changeOrigin: true,
+});
+
+novncProxy.on("error", (err, _req, res) => {
+  console.error("[novnc proxy] error:", err);
+  try {
+    if (res && typeof res.writeHead === "function" && !res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("noVNC unavailable - is Chrome starting up?\n");
+    }
+  } catch {
+    // ignore
+  }
+});
+
+novncProxy.on("proxyRes", (proxyRes, req, res) => {
+  console.log(`[novnc proxy] response: ${proxyRes.statusCode} for ${req.url}`);
+});
+
+// Health check for Chrome CDP
+app.get("/setup/api/chrome-status", requireSetupAuth, async (_req, res) => {
+  try {
+    const response = await fetch("http://localhost:9222/json/version", { timeout: 5000 });
+    const data = await response.json();
+    res.json({
+      ok: true,
+      browser: data.Browser,
+      version: data["Protocol-Version"],
+      webSocketDebuggerUrl: data.webSocketDebuggerUrl,
+    });
+  } catch (err) {
+    res.status(503).json({
+      ok: false,
+      error: "Chrome CDP not ready",
+      details: String(err),
+    });
+  }
+});
+
+// Serve noVNC at /vnc (same auth as /setup)
+// vnc.html needs: /app (UI assets), /core (RFB protocol), /vendor (deps), /websockify (WS)
+const noVncDirs = ["/app", "/core", "/vendor", "/websockify"];
+
+app.use(noVncDirs, requireSetupAuth, (req, res) => {
+  // Reconstruct full path for the proxy (Express strips baseUrl from req.url)
+  req.url = req.baseUrl + req.url;
+  novncProxy.web(req, res);
+});
+
+app.use("/vnc.html", requireSetupAuth, (req, res) => {
+  // Express strips the matched path from req.url, so we need to restore it
+  // for the proxy to request the correct file from websockify
+  req.url = "/vnc.html";
+  novncProxy.web(req, res);
+});
+
+// Special case: /vnc root redirects to vnc.html
+app.get(["/vnc", "/vnc/"], requireSetupAuth, (req, res) => {
+  req.url = "/vnc.html";
+  novncProxy.web(req, res);
+});
+
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
 // not just the /setup routes.  Healthcheck is excluded so Railway probes work.
@@ -1409,6 +1510,9 @@ app.use(requireDashboardAuth, async (req, res) => {
   attachGatewayAuthHeader(req);
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
+
+// Wait for Chrome CDP before starting server (when configured)
+await waitForChromeReady();
 
 const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
@@ -1479,7 +1583,32 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
-  // --- WebSocket password protection ---
+  // --- noVNC WebSocket (VNC connection) ---
+  // Handle both /vnc/websockify and /websockify (noVNC default)
+  if (req.url.startsWith("/vnc/websockify") || req.url.startsWith("/websockify")) {
+    // Auth check for noVNC
+    if (SETUP_PASSWORD) {
+      const header = req.headers.authorization || "";
+      const [scheme, encoded] = header.split(" ");
+      let authed = false;
+      if (scheme === "Basic" && encoded) {
+        const decoded = Buffer.from(encoded, "base64").toString("utf8");
+        const idx = decoded.indexOf(":");
+        const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+        authed = password === SETUP_PASSWORD;
+      }
+      if (!authed) {
+        socket.destroy();
+        return;
+      }
+    }
+    // Rewrite path and proxy to noVNC
+    req.url = req.url.replace(/^\/vnc/, "");
+    novncProxy.ws(req, socket, head);
+    return;
+  }
+
+  // --- Gateway WebSocket (OpenClaw) ---
   if (SETUP_PASSWORD) {
     const header = req.headers.authorization || "";
     const [scheme, encoded] = header.split(" ");

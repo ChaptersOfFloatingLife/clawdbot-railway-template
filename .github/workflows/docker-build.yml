@@ -9,6 +9,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  # Note: github.repository is already lowercase for the repo name,
+  # but the owner may contain uppercase. GHCR requires lowercase.
+  # We handle this in the tags using github.repository_owner and github.event.repository.name
 
 jobs:
   docker-build:
