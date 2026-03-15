@@ -49,7 +49,12 @@ RUN apt-get update \
     tini \
     python3 \
     python3-venv \
+    tzdata \
+  && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+  && echo "Asia/Shanghai" > /etc/timezone \
   && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=Asia/Shanghai
 
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
