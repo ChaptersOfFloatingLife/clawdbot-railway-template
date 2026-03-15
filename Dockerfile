@@ -51,6 +51,18 @@ RUN apt-get update \
     python3-venv \
   && rm -rf /var/lib/apt/lists/*
 
+# Chrome + VNC stack for CDP support
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    xvfb \
+    x11vnc \
+    novnc \
+    websockify \
+    supervisor \
+  && rm -rf /var/lib/apt/lists/*
+
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
@@ -62,6 +74,10 @@ ENV NPM_CONFIG_CACHE=/data/npm-cache
 ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
 ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
+
+# CDP browser configuration
+ENV BROWSER_CDP_URL=http://localhost:9222
+ENV DISPLAY=:99
 
 WORKDIR /app
 
@@ -77,6 +93,12 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"'
   && chmod +x /usr/local/bin/openclaw
 
 COPY src ./src
+COPY config ./config
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+# Create Chrome profile directory
+RUN mkdir -p /data/chrome-profile
 
 # The wrapper listens on $PORT.
 # IMPORTANT: Do not set a default PORT here.
@@ -84,6 +106,5 @@ COPY src ./src
 # If we force a different port, deployments can come up but the domain will route elsewhere.
 EXPOSE 8080
 
-# Ensure PID 1 reaps zombies and forwards signals.
-ENTRYPOINT ["tini", "--"]
-CMD ["node", "src/server.js"]
+# Use entrypoint script to clear locks, then supervisord as PID 1
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
