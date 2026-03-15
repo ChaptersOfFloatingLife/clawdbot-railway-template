@@ -42,6 +42,7 @@ RUN pnpm ui:install && pnpm ui:build
 # Runtime image
 FROM node:22-bookworm
 ENV NODE_ENV=production
+ENV TZ=Asia/Shanghai
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -49,6 +50,7 @@ RUN apt-get update \
     tini \
     python3 \
     python3-venv \
+    tzdata \
   && rm -rf /var/lib/apt/lists/*
 
 # Chrome + VNC stack for CDP support
