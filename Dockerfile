@@ -117,6 +117,11 @@ COPY config ./config
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
+# Watchdog: system-level cron for gateway health monitoring
+COPY scripts/watchdog/openclaw-watchdog.sh /usr/local/bin/openclaw-watchdog.sh
+RUN chmod +x /usr/local/bin/openclaw-watchdog.sh
+RUN echo '*/5 * * * * root /usr/local/bin/openclaw-watchdog.sh >> /var/log/openclaw-watchdog.log 2>&1' > /etc/cron.d/openclaw-watchdog
+
 # Create Chrome profile directory
 RUN mkdir -p /data/chrome-profile
 
