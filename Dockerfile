@@ -71,6 +71,18 @@ RUN apt-get update \
 
 ENV TZ=Asia/Shanghai
 
+# Chrome + VNC stack for CDP support
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    xvfb \
+    x11vnc \
+    novnc \
+    websockify \
+    supervisor \
+  && rm -rf /var/lib/apt/lists/*
+
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
