@@ -1,5 +1,6 @@
 # Build openclaw from source to avoid npm packaging gaps (some dist files are not shipped).
 FROM node:22-bookworm AS openclaw-build
+ENV TZ=Asia/Shanghai
 
 # Dependencies needed for openclaw build
 RUN apt-get update \
@@ -42,6 +43,7 @@ RUN pnpm ui:install && pnpm ui:build
 # Runtime image
 FROM node:22-bookworm
 ENV NODE_ENV=production
+ENV TZ=Asia/Shanghai
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -50,6 +52,7 @@ RUN apt-get update \
     python3 \
     python3-venv \
     tzdata \
+    cron \
   && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
   && echo "Asia/Shanghai" > /etc/timezone \
   && rm -rf /var/lib/apt/lists/*
@@ -101,6 +104,11 @@ COPY src ./src
 COPY config ./config
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
+
+# Watchdog: system-level cron for gateway health monitoring
+COPY scripts/watchdog/openclaw-watchdog.sh /usr/local/bin/openclaw-watchdog.sh
+RUN chmod +x /usr/local/bin/openclaw-watchdog.sh
+RUN echo '*/5 * * * * root /usr/local/bin/openclaw-watchdog.sh >> /var/log/openclaw-watchdog.log 2>&1' > /etc/cron.d/openclaw-watchdog
 
 # Create Chrome profile directory
 RUN mkdir -p /data/chrome-profile
