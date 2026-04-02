@@ -23,7 +23,7 @@ WORKDIR /openclaw
 
 # Pin to a known-good ref (tag/branch). Override in Railway template settings if needed.
 # Using a released tag avoids build breakage when `main` temporarily references unpublished packages.
-ARG OPENCLAW_GIT_REF=v2026.3.8
+ARG OPENCLAW_GIT_REF=v2026.4.1
 RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
 
 # Patch: relax version requirements for packages that may reference unpublished versions.
@@ -52,7 +52,12 @@ RUN apt-get update \
     python3 \
     python3-venv \
     tzdata \
+    cron \
+  && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+  && echo "Asia/Shanghai" > /etc/timezone \
   && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=Asia/Shanghai
 
 # Chrome + VNC stack for CDP support
 RUN apt-get update \
@@ -99,6 +104,11 @@ COPY src ./src
 COPY config ./config
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
+
+# Watchdog: system-level cron for gateway health monitoring
+COPY scripts/watchdog/openclaw-watchdog.sh /usr/local/bin/openclaw-watchdog.sh
+RUN chmod +x /usr/local/bin/openclaw-watchdog.sh
+RUN echo '*/5 * * * * root /usr/local/bin/openclaw-watchdog.sh >> /var/log/openclaw-watchdog.log 2>&1' > /etc/cron.d/openclaw-watchdog
 
 # Create Chrome profile directory
 RUN mkdir -p /data/chrome-profile
