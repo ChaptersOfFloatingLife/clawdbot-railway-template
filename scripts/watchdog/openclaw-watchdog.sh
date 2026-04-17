@@ -1,12 +1,18 @@
 #!/bin/bash
 #
 # openclaw-watchdog.sh
-# 系统级 watchdog - 独立于 gateway 进程生命周期
+# 系统级 watchdog - 独立于 wrapper 进程生命周期
 #
 # 设计原则：
 # - 外部性：不依赖被监控进程存活
 # - 独立性：有自己的生命周期（系统 cron）
-# - 有效性：能直接触发重启，不只是记录日志
+# - 职责单一：只做探活；恢复动作委派给 supervisord
+#
+# 探活：对 INTERNAL_GATEWAY_HOST:INTERNAL_GATEWAY_PORT 做 TCP connect，
+#   和 wrapper 内部的 probeGateway() 语义一致（gateway 主要走 WebSocket，
+#   HTTP GET / 在 token 认证下会返 401，不能用 curl -f）。
+# 恢复：`supervisorctl restart openclaw-wrapper`，让 supervisord 单点管理
+#   wrapper 生命周期，避免和 wrapper 自己 spawn 的 gateway 抢端口。
 #
 # 部署：/usr/local/bin/openclaw-watchdog.sh
 # Cron: /etc/cron.d/openclaw-watchdog
@@ -20,11 +26,14 @@ export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 # 配置（可通过环境变量覆盖）
 LOG_FILE="${WATCHDOG_LOG:-/var/log/openclaw-watchdog.log}"
 MAX_LOG_LINES=1000
-CHECK_URL="${GATEWAY_HEALTH_URL:-http://127.0.0.1:18792/}"
+GATEWAY_HOST="${INTERNAL_GATEWAY_HOST:-127.0.0.1}"
+GATEWAY_PORT="${INTERNAL_GATEWAY_PORT:-18789}"
+PROBE_TIMEOUT="${GATEWAY_PROBE_TIMEOUT:-3}"
 COOLDOWN_FILE="${WATCHDOG_COOLDOWN_FILE:-/tmp/openclaw-watchdog-cooldown}"
-COOLDOWN_SECONDS=300
-CHECK_TIMEOUT="${GATEWAY_CHECK_TIMEOUT:-10}"
+COOLDOWN_SECONDS="${WATCHDOG_COOLDOWN_SECONDS:-300}"
 PID_FILE="${WATCHDOG_PID_FILE:-/tmp/openclaw-watchdog.pid}"
+WRAPPER_PROGRAM="${WATCHDOG_WRAPPER_PROGRAM:-openclaw-wrapper}"
+SUPERVISOR_SOCK="${WATCHDOG_SUPERVISOR_SOCK:-unix:///var/run/supervisor.sock}"
 
 # 防止重复运行
 if [[ -f "$PID_FILE" ]]; then
@@ -37,12 +46,10 @@ fi
 echo $$ > "$PID_FILE"
 trap 'rm -f "$PID_FILE"' EXIT
 
-# 日志函数
 log() {
     echo "$(date -Iseconds): $1" | tee -a "$LOG_FILE"
 }
 
-# 截断日志防止膨胀
 truncate_log() {
     if [[ -f "$LOG_FILE" ]]; then
         local lines
@@ -54,22 +61,17 @@ truncate_log() {
     fi
 }
 
-# 检查 gateway 健康状态
+# TCP 探活：connect 成功即认为存活。
+# 对应 wrapper src/server.js 里的 probeGateway()。
 check_gateway() {
-    if curl -sf --max-time "$CHECK_TIMEOUT" "$CHECK_URL" > /dev/null 2>&1; then
+    if timeout "$PROBE_TIMEOUT" bash -c ">/dev/tcp/${GATEWAY_HOST}/${GATEWAY_PORT}" 2>/dev/null; then
         return 0
     fi
     return 1
 }
 
-# 获取 gateway PID（如果存在）
-get_gateway_pid() {
-    pgrep -f "openclaw-gateway" 2>/dev/null || echo ""
-}
-
-# 重启 gateway
-restart_gateway() {
-    # 检查冷却期
+# 让 supervisord 去重启 wrapper，它会负责 spawn gateway 子进程。
+restart_wrapper() {
     if [[ -f "$COOLDOWN_FILE" ]]; then
         local last_restart now elapsed
         last_restart=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
@@ -80,57 +82,36 @@ restart_gateway() {
             return 1
         fi
     fi
-    
-    log "Gateway unhealthy, attempting restart"
-    
-    # 先尝试优雅停止（如果进程还在）
-    local pid
-    pid=$(get_gateway_pid)
-    if [[ -n "$pid" ]]; then
-        log "Found gateway PID: $pid, sending SIGTERM"
-        kill -TERM "$pid" 2>/dev/null || true
-        sleep 2
-        # 如果还在，强制结束
-        if kill -0 "$pid" 2>/dev/null; then
-            log "Gateway still running, sending SIGKILL"
-            kill -KILL "$pid" 2>/dev/null || true
-            sleep 1
-        fi
-    fi
-    
-    # 启动 gateway
-    log "Starting gateway..."
-    if openclaw gateway start >> "$LOG_FILE" 2>&1; then
-        # 记录重启时间
+
+    log "Gateway unhealthy (tcp ${GATEWAY_HOST}:${GATEWAY_PORT} unreachable), restarting ${WRAPPER_PROGRAM} via supervisorctl"
+
+    if supervisorctl -s "$SUPERVISOR_SOCK" restart "$WRAPPER_PROGRAM" >> "$LOG_FILE" 2>&1; then
         date +%s > "$COOLDOWN_FILE"
-        sleep 3
+        # supervisord startsecs=5 + gateway ready ~数秒，给 15s 宽限。
+        sleep 15
         if check_gateway; then
-            log "Gateway restarted successfully"
+            log "Gateway recovered after supervisorctl restart"
             return 0
         else
-            log "Gateway start command succeeded but health check failed"
+            log "supervisorctl restart ran but gateway still unreachable"
             return 1
         fi
     else
-        log "Gateway start command failed"
+        log "ERROR: supervisorctl restart ${WRAPPER_PROGRAM} failed"
         return 1
     fi
 }
 
-# 主逻辑
 main() {
     truncate_log
-    
+
     if check_gateway; then
-        # 健康，静默退出（可选：记录 verbose 日志）
         exit 0
     fi
-    
-    # 不健康，尝试重启
-    if restart_gateway; then
+
+    if restart_wrapper; then
         exit 0
     else
-        log "ERROR: Failed to restart gateway"
         exit 1
     fi
 }
