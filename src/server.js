@@ -169,6 +169,14 @@ function isConfigured() {
 let gatewayProc = null;
 let gatewayStarting = null;
 
+// Auto-respawn state. The openclaw gateway periodically exits cleanly on its own
+// (observed code=0 every ~10 min); without a respawn here the proxy stays dead
+// until the next HTTP request or the external watchdog kicks the whole wrapper.
+let gatewayIntentionalStop = false;
+let gatewayRespawnAttempts = 0;
+let gatewayRespawnTimer = null;
+const GATEWAY_RESPAWN_MAX_ATTEMPTS = 5;
+
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
 let lastGatewayExit = null;
@@ -237,6 +245,7 @@ async function startGateway() {
     console.error(msg);
     lastGatewayError = msg;
     gatewayProc = null;
+    if (!gatewayIntentionalStop) scheduleGatewayRespawn();
   });
 
   gatewayProc.on("exit", (code, signal) => {
@@ -244,7 +253,38 @@ async function startGateway() {
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
     gatewayProc = null;
+    const wasIntentional = gatewayIntentionalStop;
+    gatewayIntentionalStop = false;
+    if (!wasIntentional) scheduleGatewayRespawn();
   });
+}
+
+function scheduleGatewayRespawn() {
+  if (gatewayRespawnTimer) return;
+  if (gatewayRespawnAttempts >= GATEWAY_RESPAWN_MAX_ATTEMPTS) {
+    console.error(
+      `[gateway] auto-respawn giving up after ${gatewayRespawnAttempts} attempts; ` +
+        "will retry on next HTTP request or watchdog tick"
+    );
+    return;
+  }
+  const delayMs = Math.min(16_000, 1000 * 2 ** gatewayRespawnAttempts);
+  gatewayRespawnAttempts += 1;
+  console.error(
+    `[gateway] scheduling auto-respawn in ${delayMs}ms ` +
+      `(attempt ${gatewayRespawnAttempts}/${GATEWAY_RESPAWN_MAX_ATTEMPTS})`
+  );
+  gatewayRespawnTimer = setTimeout(async () => {
+    gatewayRespawnTimer = null;
+    try {
+      await ensureGatewayRunning();
+      gatewayRespawnAttempts = 0;
+      console.log("[gateway] auto-respawn succeeded");
+    } catch (err) {
+      console.error(`[gateway] auto-respawn failed: ${String(err)}`);
+      scheduleGatewayRespawn();
+    }
+  }, delayMs);
 }
 
 async function runDoctorBestEffort() {
@@ -290,11 +330,19 @@ async function ensureGatewayRunning() {
 }
 
 async function restartGateway() {
+  // Cancel any pending auto-respawn so it doesn't race our explicit restart.
+  if (gatewayRespawnTimer) {
+    clearTimeout(gatewayRespawnTimer);
+    gatewayRespawnTimer = null;
+  }
+  gatewayRespawnAttempts = 0;
+
   if (gatewayProc) {
     try {
+      gatewayIntentionalStop = true;
       gatewayProc.kill("SIGTERM");
     } catch {
-      // ignore
+      gatewayIntentionalStop = false;
     }
     // Give it a moment to exit and release the port.
     await sleep(750);
